@@ -3,9 +3,11 @@ import telebot
 import threading
 import time
 import requests
+import json
+import re
 from flask import Flask
 
-# 1. Grab your keys safely from Render's settings
+# 1. Grab your keys safely from Render's environment settings
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 MY_CHAT_ID = os.environ.get("MY_CHAT_ID")
 
@@ -15,7 +17,7 @@ bot = telebot.TeleBot(BOT_TOKEN)
 RECORDING_LIST = []
 ACTIVE_THREADS = {}
 
-# --- TRICK RENDER: Fake Web Server Setup ---
+# --- RENDER PROXY: Fake Web Server Setup ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -23,7 +25,6 @@ def home():
     return "Bot status: Online and tracking."
 
 def run_web_server():
-    # Render automatically tells our app what port to use
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 # -------------------------------------------
@@ -61,7 +62,8 @@ def stop_record_command(message):
         bot.reply_to(message, "⚠️ No active recording or monitoring sessions are running right now.")
         return
         
-    username = RECORDING_LIST[0] 
+    # Stop the first active user in the list
+    username = RECORDING_LIST[0]
     RECORDING_LIST.remove(username)
     bot.reply_to(message, f"🛑 Stopping background capture for @{username}...")
     
@@ -71,7 +73,7 @@ def stop_record_command(message):
         try:
             with open(filename, 'rb') as video_file:
                 bot.send_video(MY_CHAT_ID, video_file, caption=f"Here is your automatically saved recording for @{username}!")
-            os.remove(filename) 
+            os.remove(filename) # Instantly clear space on the free server
         except Exception as e:
             bot.send_message(MY_CHAT_ID, f"❌ Error sending file: {e}")
     else:
@@ -88,10 +90,12 @@ def list_active_targets(message):
 # 3. Dynamic Stream Capture Engine
 def stream_download_worker(username, stream_url):
     filename = f"{username}_live.mp4"
+    print(f"Opening data bridge for {username}...")
     try:
+        # Connect directly to the video feed URL and stream data blocks
         response = requests.get(stream_url, stream=True, timeout=15)
         with open(filename, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=1024*1024): 
+            for chunk in response.iter_content(chunk_size=1024*1024): # 1MB chunks
                 if username not in RECORDING_LIST:
                     break
                 if chunk:
@@ -100,6 +104,7 @@ def stream_download_worker(username, stream_url):
         print(f"Data stream interrupted for {username}: {e}")
 
 def background_monitor_loop():
+    """Scans your targeted users list every 60 seconds completely invisibly"""
     while True:
         for username in list(RECORDING_LIST):
             if username in ACTIVE_THREADS and ACTIVE_THREADS[username].is_alive():
@@ -107,23 +112,38 @@ def background_monitor_loop():
                 
             try:
                 url = f"https://tiktok.com@{username}/live"
-                headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)"}
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+                }
                 response = requests.get(url, headers=headers, timeout=10)
                 
+                # Verify if the creator is actively broadcasting live
                 if '"roomInfo":{"status":2}' in response.text:
-                    bot.send_message(MY_CHAT_ID, f"🚨 ALERT: @{username} is LIVE! Recording stream blocks in the cloud...")
-                    target_stream_url = "http://example.com"
                     
-                    t = threading.Thread(target=stream_download_worker, args=(username, target_stream_url), daemon=True)
-                    t.start()
-                    ACTIVE_THREADS[username] = t
+                    # Scrape the hidden JSON video link payload out of the page layout
+                    match = re.search(r'<script id="RENDER_DATA" type="application/json">(.*?)</script>', response.text)
+                    if match:
+                        raw_data = requests.utils.unquote(match.group(1))
+                        json_data = json.loads(raw_data)
+                        
+                        # Grab the hidden high-definition stream URL target
+                        room_info = json_data.get("appContext", {}).get("states", {}).get("roomInfo", {})
+                        real_stream_url = room_info.get("stream_url", {}).get("rtmp_pull_url")
+                        
+                        if real_stream_url:
+                            bot.send_message(MY_CHAT_ID, f"🚨 ALERT: @{username} is LIVE! Secretly capturing video chunks in the cloud...")
+                            
+                            # Launch downloading loop on a separate worker thread
+                            t = threading.Thread(target=stream_download_worker, args=(username, real_stream_url), daemon=True)
+                            t.start()
+                            ACTIVE_THREADS[username] = t
             except Exception as e:
                 print(f"Error monitoring {username}: {e}")
                 
         time.sleep(60)
 
 if __name__ == "__main__":
-    # Start the fake web server so Render is happy
+    # Start the web server trick so Render is happy
     threading.Thread(target=run_web_server, daemon=True).start()
     
     # Start background polling routine
